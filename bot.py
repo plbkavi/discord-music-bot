@@ -193,7 +193,8 @@ async def init_database():
                 position INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
-                requested_by TEXT NOT NULL
+                requested_by TEXT NOT NULL,
+                source_name TEXT NOT NULL DEFAULT 'Неизвестный источник'
             )
         """)
 
@@ -227,6 +228,7 @@ async def init_database():
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
                 requested_by TEXT NOT NULL,
+                source_name TEXT NOT NULL DEFAULT 'Неизвестный источник',
                 played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -251,6 +253,22 @@ async def init_database():
                 "ALTER TABLE guild_settings ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
             )
 
+        async with db.execute("PRAGMA table_info(music_queue)") as cursor:
+            queue_columns = {row[1] async for row in cursor}
+        if "source_name" not in queue_columns:
+            await db.execute(
+                "ALTER TABLE music_queue ADD COLUMN source_name TEXT NOT NULL "
+                "DEFAULT 'Неизвестный источник'"
+            )
+
+        async with db.execute("PRAGMA table_info(play_history)") as cursor:
+            history_columns = {row[1] async for row in cursor}
+        if "source_name" not in history_columns:
+            await db.execute(
+                "ALTER TABLE play_history ADD COLUMN source_name TEXT NOT NULL "
+                "DEFAULT 'Неизвестный источник'"
+            )
+
         await db.commit()
 
 
@@ -266,16 +284,17 @@ async def load_saved_data():
                 autoplay_modes[guild_id] = bool(autoplay)
 
         async with db.execute("""
-            SELECT guild_id, title, url, requested_by
+            SELECT guild_id, title, url, requested_by, source_name
             FROM music_queue
             ORDER BY guild_id, position, id
         """) as cursor:
-            async for guild_id, title, url, requested_by in cursor:
+            async for guild_id, title, url, requested_by, source_name in cursor:
                 get_queue(guild_id).append(
                     Track(
                         title=title,
                         url=url,
                         requested_by=requested_by,
+                        source_name=source_name,
                     )
                 )
 
@@ -329,15 +348,17 @@ async def save_queue(guild_id: int):
                     position,
                     title,
                     url,
-                    requested_by
+                    requested_by,
+                    source_name
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 guild_id,
                 position,
                 track.title,
                 track.url,
                 track.requested_by,
+                track.source_name,
             ))
 
         await db.commit()
@@ -390,14 +411,16 @@ async def add_history_item(guild_id: int, track: Track):
                 guild_id,
                 title,
                 url,
-                requested_by
+                requested_by,
+                source_name
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
         """, (
             guild_id,
             track.title,
             track.url,
             track.requested_by,
+            track.source_name,
         ))
 
         await db.execute("""
@@ -483,7 +506,7 @@ async def get_history(guild_id: int) -> list[tuple]:
 
     async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
         async with db.execute("""
-            SELECT title, requested_by, played_at
+            SELECT title, requested_by, source_name, played_at
             FROM play_history
             WHERE guild_id = ?
             ORDER BY id DESC
@@ -492,10 +515,11 @@ async def get_history(guild_id: int) -> list[tuple]:
             guild_id,
             MAX_HISTORY_ITEMS,
         )) as cursor:
-            async for title, requested_by, played_at in cursor:
+            async for title, requested_by, source_name, played_at in cursor:
                 items.append((
                     title,
                     requested_by,
+                    source_name,
                     played_at,
                 ))
 
@@ -720,6 +744,28 @@ def get_now_playing_text(guild_id: int) -> str:
     )
 
 
+def format_source_name(source_name: str) -> str:
+    source_name = source_name or "Неизвестный источник"
+    icons = {
+        "YouTube": "▶️",
+        "SoundCloud": "☁️",
+        "Spotify": "🟢",
+        "Яндекс Музыка": "🟡",
+        "Прямая ссылка": "🔗",
+        "YouTube autoplay": "✨",
+    }
+    return f"{icons.get(source_name, '🔗')} {source_name}"
+
+
+def get_source_name_from_url(url: str) -> str:
+    url = url.lower()
+    if "youtube.com" in url or "youtu.be" in url:
+        return "YouTube"
+    if "soundcloud.com" in url:
+        return "SoundCloud"
+    return "Прямая ссылка"
+
+
 def get_queue_text(guild_id: int) -> str:
     current = current_tracks.get(guild_id)
     queue_items = list(get_queue(guild_id))
@@ -732,6 +778,7 @@ def get_queue_text(guild_id: int) -> str:
     if current:
         text += (
             f"**Сейчас играет:** {current.title}\n"
+            f"Источник: {format_source_name(current.source_name)}\n"
             f"Добавил: {current.requested_by}\n\n"
         )
 
@@ -741,7 +788,8 @@ def get_queue_text(guild_id: int) -> str:
         for index, track in enumerate(queue_items[:10], start=1):
             text += (
                 f"{index}. {track.title} "
-                f"— добавил {track.requested_by}\n"
+                f"— {format_source_name(track.source_name)}, "
+                f"добавил {track.requested_by}\n"
             )
 
         if len(queue_items) > 10:
@@ -1280,6 +1328,7 @@ class SearchButton(discord.ui.Button):
                 interaction=interaction,
                 url=self.track["webpage_url"],
                 title=title,
+                source_name="YouTube",
             )
 
             for item in self.view.children:
@@ -1835,10 +1884,11 @@ class MusicPanel(discord.ui.View):
         text = "**Последние воспроизведённые треки:**\n\n"
 
         for index, item in enumerate(history_items, start=1):
-            title, requested_by, played_at = item
+            title, requested_by, source_name, played_at = item
 
             text += (
                 f"{index}. {title}\n"
+                f"Источник: {format_source_name(source_name)}\n"
                 f"Добавил: {requested_by}, время: {played_at}\n\n"
             )
 
