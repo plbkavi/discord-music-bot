@@ -1,0 +1,19 @@
+# Секреты
+.env
+.env*
+
+# Виртуальное окружение и Python-кэш
+.venv/
+__pycache__/
+*.py[cod]
+
+# Локальная SQLite-база
+*.db
+*.sqlite
+*.sqlite3
+
+# Кэш
+.cache/
+
+# Логи
+*.log
