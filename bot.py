@@ -572,6 +572,36 @@ def is_yandex_music_url(url: str) -> bool:
     return "music.yandex." in url
 
 
+def is_soundcloud_playlist_url(url: str) -> bool:
+    clean_url = url.lower().split("?", 1)[0].rstrip("/")
+    return "soundcloud.com/" in clean_url and "/sets/" in clean_url
+
+
+def get_soundcloud_playlist_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": False,
+        "extract_flat": True,
+        "playlistend": MAX_QUEUE_SIZE,
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    entries = info.get("entries") or []
+    tracks = []
+    for entry in entries:
+        if not entry:
+            continue
+        track_url = entry.get("webpage_url") or entry.get("url")
+        title = entry.get("title") or "Без названия"
+        if track_url:
+            tracks.append((title, track_url))
+
+    playlist_title = info.get("title") or "Плейлист SoundCloud"
+    return playlist_title, tracks[:MAX_QUEUE_SIZE]
+
+
 def yandex_track_to_query(track) -> tuple[str, str] | None:
     if not track:
         return None
@@ -2072,6 +2102,43 @@ async def play(interaction: discord.Interaction, ссылка: str):
     await interaction.response.defer(thinking=True)
 
     try:
+        if is_soundcloud_playlist_url(ссылка):
+            playlist_title, playlist_tracks = await asyncio.to_thread(
+                get_soundcloud_playlist_tracks, ссылка
+            )
+            if not playlist_tracks:
+                raise RuntimeError("В плейлисте SoundCloud не найдено доступных треков.")
+
+            added = 0
+            started_title = None
+            failed = 0
+            for title, track_url in playlist_tracks:
+                try:
+                    _, started = await add_to_queue(
+                        interaction=interaction,
+                        url=track_url,
+                        title=title,
+                        source_name="SoundCloud",
+                        original_query=ссылка,
+                    )
+                    added += 1
+                    if started:
+                        started_title = title
+                except Exception as track_error:
+                    failed += 1
+                    print(f"Не удалось добавить трек SoundCloud {title!r}: {track_error!r}")
+
+            if not added:
+                raise RuntimeError("Не удалось добавить треки из плейлиста SoundCloud.")
+
+            message = f"☁️ Добавлено из SoundCloud-плейлиста **{playlist_title}**: **{added}** трек(ов)."
+            if started_title:
+                message += f" Сейчас играет: **{started_title}**."
+            if failed:
+                message += f" Не добавлено: **{failed}**."
+            await interaction.followup.send(message)
+            return
+
         if is_spotify_url(ссылка):
             source_label = "Spotify"
             source_type, music_tracks = await asyncio.to_thread(get_spotify_tracks, ссылка)
@@ -2157,6 +2224,7 @@ async def play(interaction: discord.Interaction, ссылка: str):
             interaction=interaction,
             url=url,
             title=title,
+            source_name=get_source_name_from_url(url),
         )
         if started:
             message = f"Сейчас играет: **{title}**"
