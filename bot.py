@@ -27,7 +27,7 @@ TEST_SOUND_PATH = "/opt/discord_bot/sounds/test.mp3"
 IDLE_DISCONNECT_SECONDS = 120
 MAX_HISTORY_ITEMS = 20
 MAX_FAVORITES_SHOWN = 20
-MAX_SPOTIFY_TRACKS = 100
+MAX_PLAYLIST_TRACKS = 100
 MAX_MATCH_CHOICES = 5
 MAX_QUEUE_SIZE = 100
 
@@ -109,10 +109,10 @@ track_details: dict[int, dict] = {}
 queue_locks: dict[int, asyncio.Lock] = {}
 volumes: dict[int, float] = {}
 repeat_modes: dict[int, str] = {}
-autoplay_modes: dict[int, bool] = {}
 idle_disconnect_tasks: dict[int, asyncio.Task] = {}
 skip_requested: set[int] = set()
 panel_locations: dict[int, tuple[int, int]] = {}
+panel_locks: dict[int, asyncio.Lock] = {}
 
 
 def get_queue(guild_id: int) -> deque[Track]:
@@ -129,6 +129,12 @@ def get_lock(guild_id: int) -> asyncio.Lock:
     return queue_locks[guild_id]
 
 
+def get_panel_lock(guild_id: int) -> asyncio.Lock:
+    if guild_id not in panel_locks:
+        panel_locks[guild_id] = asyncio.Lock()
+    return panel_locks[guild_id]
+
+
 def get_volume(guild_id: int) -> float:
     if guild_id not in volumes:
         volumes[guild_id] = 0.5
@@ -141,10 +147,6 @@ def get_repeat_mode(guild_id: int) -> str:
         repeat_modes[guild_id] = "off"
 
     return repeat_modes[guild_id]
-
-
-def get_autoplay_mode(guild_id: int) -> bool:
-    return autoplay_modes.get(guild_id, False)
 
 
 def get_repeat_text(guild_id: int) -> str:
@@ -174,10 +176,7 @@ def format_duration(seconds) -> str:
 
 
 async def init_database():
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA busy_timeout = 10000")
-        await db.execute("PRAGMA foreign_keys = ON")
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -193,8 +192,7 @@ async def init_database():
                 position INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
-                requested_by TEXT NOT NULL,
-                source_name TEXT NOT NULL DEFAULT 'Неизвестный источник'
+                requested_by TEXT NOT NULL
             )
         """)
 
@@ -228,7 +226,6 @@ async def init_database():
                 title TEXT NOT NULL,
                 url TEXT NOT NULL,
                 requested_by TEXT NOT NULL,
-                source_name TEXT NOT NULL DEFAULT 'Неизвестный источник',
                 played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -246,55 +243,30 @@ async def init_database():
             )
         """)
 
-        async with db.execute("PRAGMA table_info(guild_settings)") as cursor:
-            columns = {row[1] async for row in cursor}
-        if "autoplay" not in columns:
-            await db.execute(
-                "ALTER TABLE guild_settings ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
-            )
-
-        async with db.execute("PRAGMA table_info(music_queue)") as cursor:
-            queue_columns = {row[1] async for row in cursor}
-        if "source_name" not in queue_columns:
-            await db.execute(
-                "ALTER TABLE music_queue ADD COLUMN source_name TEXT NOT NULL "
-                "DEFAULT 'Неизвестный источник'"
-            )
-
-        async with db.execute("PRAGMA table_info(play_history)") as cursor:
-            history_columns = {row[1] async for row in cursor}
-        if "source_name" not in history_columns:
-            await db.execute(
-                "ALTER TABLE play_history ADD COLUMN source_name TEXT NOT NULL "
-                "DEFAULT 'Неизвестный источник'"
-            )
-
         await db.commit()
 
 
 async def load_saved_data():
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute("""
-            SELECT guild_id, volume, repeat_mode, autoplay
+            SELECT guild_id, volume, repeat_mode
             FROM guild_settings
         """) as cursor:
-            async for guild_id, volume, repeat_mode, autoplay in cursor:
+            async for guild_id, volume, repeat_mode in cursor:
                 volumes[guild_id] = volume
                 repeat_modes[guild_id] = repeat_mode
-                autoplay_modes[guild_id] = bool(autoplay)
 
         async with db.execute("""
-            SELECT guild_id, title, url, requested_by, source_name
+            SELECT guild_id, title, url, requested_by
             FROM music_queue
             ORDER BY guild_id, position, id
         """) as cursor:
-            async for guild_id, title, url, requested_by, source_name in cursor:
+            async for guild_id, title, url, requested_by in cursor:
                 get_queue(guild_id).append(
                     Track(
                         title=title,
                         url=url,
                         requested_by=requested_by,
-                        source_name=source_name,
                     )
                 )
 
@@ -312,30 +284,31 @@ async def load_saved_data():
 
 
 async def save_guild_settings(guild_id: int):
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO guild_settings (
-                guild_id, volume, repeat_mode, autoplay
+                guild_id,
+                volume,
+                repeat_mode
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?)
             ON CONFLICT(guild_id)
             DO UPDATE SET
                 volume = excluded.volume,
-                repeat_mode = excluded.repeat_mode,
-                autoplay = excluded.autoplay
+                repeat_mode = excluded.repeat_mode
         """, (
             guild_id,
             get_volume(guild_id),
             get_repeat_mode(guild_id),
-            int(get_autoplay_mode(guild_id)),
         ))
+
         await db.commit()
 
 
 async def save_queue(guild_id: int):
     queue_items = list(get_queue(guild_id))
 
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
             "DELETE FROM music_queue WHERE guild_id = ?",
             (guild_id,),
@@ -348,17 +321,15 @@ async def save_queue(guild_id: int):
                     position,
                     title,
                     url,
-                    requested_by,
-                    source_name
+                    requested_by
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 guild_id,
                 position,
                 track.title,
                 track.url,
                 track.requested_by,
-                track.source_name,
             ))
 
         await db.commit()
@@ -371,7 +342,7 @@ async def save_panel_location(
 ):
     panel_locations[guild_id] = (channel_id, message_id)
 
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO music_panels (
                 guild_id,
@@ -395,7 +366,7 @@ async def save_panel_location(
 async def delete_panel_location(guild_id: int):
     panel_locations.pop(guild_id, None)
 
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
             "DELETE FROM music_panels WHERE guild_id = ?",
             (guild_id,),
@@ -405,22 +376,20 @@ async def delete_panel_location(guild_id: int):
 
 
 async def add_history_item(guild_id: int, track: Track):
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO play_history (
                 guild_id,
                 title,
                 url,
-                requested_by,
-                source_name
+                requested_by
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?)
         """, (
             guild_id,
             track.title,
             track.url,
             track.requested_by,
-            track.source_name,
         ))
 
         await db.execute("""
@@ -447,7 +416,7 @@ async def add_favorite(
     user: discord.abc.User,
     track: Track,
 ) -> bool:
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute("""
             INSERT OR IGNORE INTO favorites (
                 guild_id,
@@ -476,7 +445,7 @@ async def get_favorites(
 ) -> list[Track]:
     tracks = []
 
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute("""
             SELECT title, url, user_name
             FROM favorites
@@ -504,9 +473,9 @@ async def get_favorites(
 async def get_history(guild_id: int) -> list[tuple]:
     items = []
 
-    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute("""
-            SELECT title, requested_by, source_name, played_at
+            SELECT title, requested_by, played_at
             FROM play_history
             WHERE guild_id = ?
             ORDER BY id DESC
@@ -515,11 +484,10 @@ async def get_history(guild_id: int) -> list[tuple]:
             guild_id,
             MAX_HISTORY_ITEMS,
         )) as cursor:
-            async for title, requested_by, source_name, played_at in cursor:
+            async for title, requested_by, played_at in cursor:
                 items.append((
                     title,
                     requested_by,
-                    source_name,
                     played_at,
                 ))
 
@@ -549,131 +517,12 @@ def search_videos(query: str) -> list[dict]:
         if entry and entry.get("webpage_url")
     ]
 
-
-def find_autoplay_track(previous_track: Track) -> Track | None:
-    query = f"{previous_track.title} similar music"
-    for entry in search_videos(query):
-        url = entry.get("webpage_url")
-        if url and url != previous_track.url:
-            return Track(
-                title=entry.get("title", "Автоматическая рекомендация"),
-                url=url,
-                requested_by="Автовоспроизведение",
-                source_name="YouTube autoplay",
-                original_query=query,
-            )
-    return None
-
-
 def is_spotify_url(url: str) -> bool:
     return "open.spotify.com/" in url or url.startswith("spotify:")
 
 
 def is_yandex_music_url(url: str) -> bool:
     return "music.yandex." in url
-
-
-def is_soundcloud_playlist_url(url: str) -> bool:
-    clean_url = url.lower().split("?", 1)[0].rstrip("/")
-    return "soundcloud.com/" in clean_url and "/sets/" in clean_url
-
-
-def get_soundcloud_playlist_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": False,
-        "extract_flat": True,
-        "playlistend": MAX_QUEUE_SIZE,
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    entries = info.get("entries") or []
-    tracks = []
-    for entry in entries:
-        if not entry:
-            continue
-        track_url = entry.get("webpage_url") or entry.get("url")
-        title = entry.get("title") or "Без названия"
-        if track_url:
-            tracks.append((title, track_url))
-
-    playlist_title = info.get("title") or "Плейлист SoundCloud"
-    return playlist_title, tracks[:MAX_QUEUE_SIZE]
-
-
-def is_youtube_playlist_url(url: str) -> bool:
-    clean_url = url.lower()
-    return (
-        ("youtube.com/playlist" in clean_url and "list=" in clean_url)
-        or ("youtube.com/watch" in clean_url and "list=" in clean_url)
-        or ("youtu.be/" in clean_url and "list=" in clean_url)
-    )
-
-
-def get_youtube_playlist_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": False,
-        "extract_flat": True,
-        "playlistend": MAX_QUEUE_SIZE,
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    entries = info.get("entries") or []
-    tracks = []
-    for entry in entries:
-        if not entry:
-            continue
-        track_url = entry.get("webpage_url") or entry.get("url")
-        title = entry.get("title") or "Без названия"
-        if track_url:
-            tracks.append((title, track_url))
-
-    playlist_title = info.get("title") or "YouTube-плейлист"
-    return playlist_title, tracks[:MAX_QUEUE_SIZE]
-
-
-async def add_direct_playlist_to_queue(
-    interaction: discord.Interaction,
-    playlist_title: str,
-    playlist_tracks: list[tuple[str, str]],
-    source_name: str,
-):
-    if not playlist_tracks:
-        raise RuntimeError(f"В плейлисте {source_name} не найдено доступных треков.")
-
-    added = 0
-    started_title = None
-    failed = 0
-    for title, track_url in playlist_tracks:
-        try:
-            _, started = await add_to_queue(
-                interaction=interaction,
-                url=track_url,
-                title=title,
-                source_name=source_name,
-                original_query=playlist_title,
-            )
-            added += 1
-            if started:
-                started_title = title
-        except Exception as track_error:
-            failed += 1
-            print(f"Не удалось добавить трек {source_name} {title!r}: {track_error!r}")
-
-    if not added:
-        raise RuntimeError(f"Не удалось добавить треки из плейлиста {source_name}.")
-
-    message = f"Добавлено из {source_name}-плейлиста **{playlist_title}**: **{added}** трек(ов)."
-    if started_title:
-        message += f" Сейчас играет: **{started_title}**."
-    if failed:
-        message += f" Не добавлено: **{failed}**."
-    await interaction.followup.send(message)
 
 
 def yandex_track_to_query(track) -> tuple[str, str] | None:
@@ -725,10 +574,11 @@ def get_yandex_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
                 track = yandex_track_to_query(item)
                 if track:
                     tracks.append(track)
-        return "альбом", tracks[:MAX_SPOTIFY_TRACKS]
+        return "альбом", tracks[:MAX_PLAYLIST_TRACKS]
 
     raise RuntimeError(
-        "Поддерживаются ссылки Яндекс Музыки на трек или альбом."
+        "Поддерживаются ссылки Яндекс Музыки на трек или альбом. "
+        "Плейлисты можно добавить позже отдельно."
     )
 
 
@@ -759,19 +609,19 @@ def get_spotify_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
     if "/album/" in url or url.startswith("spotify:album:"):
         album = spotify.album(url)
         items = album["tracks"]["items"]
-        while album["tracks"].get("next") and len(items) < MAX_SPOTIFY_TRACKS:
+        while album["tracks"].get("next") and len(items) < MAX_PLAYLIST_TRACKS:
             album["tracks"] = spotify.next(album["tracks"])
             items.extend(album["tracks"]["items"])
-        return "альбом", [track for item in items[:MAX_SPOTIFY_TRACKS] if (track := spotify_item_to_query(item))]
+        return "альбом", [track for item in items[:MAX_PLAYLIST_TRACKS] if (track := spotify_item_to_query(item))]
 
     if "/playlist/" in url or url.startswith("spotify:playlist:"):
         page = spotify.playlist_items(url, additional_types=("track",), limit=100)
         items = page["items"]
-        while page.get("next") and len(items) < MAX_SPOTIFY_TRACKS:
+        while page.get("next") and len(items) < MAX_PLAYLIST_TRACKS:
             page = spotify.next(page)
             items.extend(page["items"])
         tracks = []
-        for entry in items[:MAX_SPOTIFY_TRACKS]:
+        for entry in items[:MAX_PLAYLIST_TRACKS]:
             track = spotify_item_to_query(entry.get("track"))
             if track:
                 tracks.append(track)
@@ -794,6 +644,7 @@ def search_soundcloud(query: str) -> list[dict]:
         for entry in result.get("entries", [])
         if entry and entry.get("webpage_url")
     ]
+
 
 
 def build_candidates(query: str) -> list[MatchCandidate]:
@@ -834,16 +685,6 @@ def build_candidates(query: str) -> list[MatchCandidate]:
 
     return candidates
 
-
-# --- ДОБАВЛЕНА НЕДОСТАЮЩАЯ ФУНКЦИЯ ДЛЯ АВТОПОИСКА МНОЖЕСТВЕННЫХ ТРЕКОВ ---
-def resolve_music_track(query: str) -> tuple[str, str, str]:
-    candidates = build_candidates(query)
-    if not candidates:
-        raise RuntimeError(f"Не удалось найти трек по запросу: {query}")
-    first = candidates[0]
-    return first.url, first.title, first.source_name
-
-
 def get_now_playing_text(guild_id: int) -> str:
     track = current_tracks.get(guild_id)
 
@@ -854,28 +695,6 @@ def get_now_playing_text(guild_id: int) -> str:
         f"Сейчас играет: **{track.title}**\n"
         f"Добавил: {track.requested_by}"
     )
-
-
-def format_source_name(source_name: str) -> str:
-    source_name = source_name or "Неизвестный источник"
-    icons = {
-        "YouTube": "▶️",
-        "SoundCloud": "☁️",
-        "Spotify": "🟢",
-        "Яндекс Музыка": "🟡",
-        "Прямая ссылка": "🔗",
-        "YouTube autoplay": "✨",
-    }
-    return f"{icons.get(source_name, '🔗')} {source_name}"
-
-
-def get_source_name_from_url(url: str) -> str:
-    url = url.lower()
-    if "youtube.com" in url or "youtu.be" in url:
-        return "YouTube"
-    if "soundcloud.com" in url:
-        return "SoundCloud"
-    return "Прямая ссылка"
 
 
 def get_queue_text(guild_id: int) -> str:
@@ -890,7 +709,6 @@ def get_queue_text(guild_id: int) -> str:
     if current:
         text += (
             f"**Сейчас играет:** {current.title}\n"
-            f"Источник: {format_source_name(current.source_name)}\n"
             f"Добавил: {current.requested_by}\n\n"
         )
 
@@ -900,8 +718,7 @@ def get_queue_text(guild_id: int) -> str:
         for index, track in enumerate(queue_items[:10], start=1):
             text += (
                 f"{index}. {track.title} "
-                f"— {format_source_name(track.source_name)}, "
-                f"добавил {track.requested_by}\n"
+                f"— добавил {track.requested_by}\n"
             )
 
         if len(queue_items) > 10:
@@ -934,12 +751,6 @@ def build_now_playing_embed(guild_id: int) -> discord.Embed:
         embed.add_field(
             name="В очереди",
             value=str(queue_count),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="Автовоспроизведение",
-            value="✅ Включено" if get_autoplay_mode(guild_id) else "❌ Выключено",
             inline=True,
         )
 
@@ -998,12 +809,6 @@ def build_now_playing_embed(guild_id: int) -> discord.Embed:
         inline=True,
     )
 
-    embed.add_field(
-        name="Автовоспроизведение",
-        value="✅ Включено" if get_autoplay_mode(guild_id) else "❌ Выключено",
-        inline=True,
-    )
-
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
 
@@ -1017,35 +822,52 @@ def build_now_playing_embed(guild_id: int) -> discord.Embed:
     return embed
 
 
-async def refresh_panel(guild_id: int):
-    location = panel_locations.get(guild_id)
+async def send_or_update_panel(guild_id: int, channel=None):
+    """Удаляет прежнюю панель и отправляет актуальную последним сообщением."""
+    async with get_panel_lock(guild_id):
+        location = panel_locations.get(guild_id)
 
-    if not location:
-        return
-
-    channel_id, message_id = location
-
-    try:
-        channel = bot.get_channel(channel_id)
+        if channel is None and location:
+            channel_id, _ = location
+            try:
+                channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden):
+                await delete_panel_location(guild_id)
+                return None
+            except discord.HTTPException as error:
+                print(f"Не удалось получить канал панели: {error!r}")
+                return None
 
         if channel is None:
-            channel = await bot.fetch_channel(channel_id)
+            return None
 
-        message = await channel.fetch_message(message_id)
+        if location:
+            old_channel_id, old_message_id = location
+            try:
+                old_channel = channel
+                if old_channel_id != channel.id:
+                    old_channel = bot.get_channel(old_channel_id) or await bot.fetch_channel(old_channel_id)
+                old_message = await old_channel.fetch_message(old_message_id)
+                await old_message.delete()
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                print("Нет права «Управление сообщениями» для удаления старой панели.")
+                return None
+            except discord.HTTPException as error:
+                print(f"Не удалось удалить старую панель: {error!r}")
+                return None
 
-        await message.edit(
-            embed=build_now_playing_embed(guild_id),
-            view=MusicPanel(),
-        )
-
-    except discord.NotFound:
-        await delete_panel_location(guild_id)
-
-    except discord.HTTPException as error:
-        print(f"Не удалось обновить панель: {error!r}")
-
-    except Exception as error:
-        print(f"Ошибка обновления панели: {error!r}")
+        try:
+            message = await channel.send(
+                embed=build_now_playing_embed(guild_id),
+                view=MusicPanel(),
+            )
+            await save_panel_location(guild_id, channel.id, message.id)
+            return message
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Не удалось отправить панель: {error!r}")
+            return None
 
 
 def cancel_idle_disconnect(guild_id: int):
@@ -1080,7 +902,7 @@ async def disconnect_if_idle(guild_id: int):
             track_details.pop(guild_id, None)
 
             await voice_client.disconnect()
-            await refresh_panel(guild_id)
+            await send_or_update_panel(guild_id)
 
             print(
                 f"Автоотключение: сервер {guild_id}, "
@@ -1146,10 +968,9 @@ async def on_track_finished(
     if error:
         print(f"Ошибка воспроизведения: {error!r}")
 
-    previous_track = None
-    need_autoplay = False
+    lock = get_lock(guild_id)
 
-    async with get_lock(guild_id):
+    async with lock:
         current_track = current_tracks.get(guild_id)
 
         if guild_id in skip_requested:
@@ -1160,28 +981,14 @@ async def on_track_finished(
 
             if repeat_mode == "track":
                 get_queue(guild_id).appendleft(current_track)
+
             elif repeat_mode == "queue":
                 get_queue(guild_id).append(current_track)
-            elif get_autoplay_mode(guild_id) and not get_queue(guild_id):
-                previous_track = current_track
-                need_autoplay = True
 
         current_tracks.pop(guild_id, None)
         track_details.pop(guild_id, None)
-        await save_queue(guild_id)
 
-    if need_autoplay and previous_track:
-        try:
-            recommendation = await asyncio.to_thread(
-                find_autoplay_track, previous_track
-            )
-            if recommendation:
-                async with get_lock(guild_id):
-                    if not get_queue(guild_id):
-                        get_queue(guild_id).append(recommendation)
-                        await save_queue(guild_id)
-        except Exception as autoplay_error:
-            print(f"Ошибка автовоспроизведения: {autoplay_error!r}")
+        await save_queue(guild_id)
 
     await start_next_track(guild_id)
 
@@ -1212,7 +1019,7 @@ async def start_next_track(guild_id: int):
             track_details.pop(guild_id, None)
 
             schedule_idle_disconnect(guild_id)
-            await refresh_panel(guild_id)
+            await send_or_update_panel(guild_id)
 
             return
 
@@ -1266,7 +1073,7 @@ async def start_next_track(guild_id: int):
 
         voice_client.play(source, after=after_playing)
 
-        await refresh_panel(guild_id)
+        await send_or_update_panel(guild_id)
 
     except Exception as error:
         print(f"Ошибка запуска трека: {error!r}")
@@ -1274,7 +1081,7 @@ async def start_next_track(guild_id: int):
         current_tracks.pop(guild_id, None)
         track_details.pop(guild_id, None)
 
-        await refresh_panel(guild_id)
+        await send_or_update_panel(guild_id)
         await start_next_track(guild_id)
 
 
@@ -1291,7 +1098,10 @@ async def add_to_queue(
         raise ValueError("Сначала зайди в голосовой канал.")
 
     guild_id = interaction.guild.id
+
     cancel_idle_disconnect(guild_id)
+
+    queue = get_queue(guild_id)
 
     track = Track(
         title=title,
@@ -1301,34 +1111,23 @@ async def add_to_queue(
         original_query=original_query,
     )
 
-    should_start = False
+    is_busy = voice_client.is_playing() or voice_client.is_paused()
+    has_current = guild_id in current_tracks
 
-    async with get_lock(guild_id):
-        queue = get_queue(guild_id)
-        is_busy = voice_client.is_playing() or voice_client.is_paused()
-        has_current = guild_id in current_tracks
-
-        if len(queue) >= MAX_QUEUE_SIZE:
-            raise ValueError(
-                f"Очередь заполнена (максимум {MAX_QUEUE_SIZE} треков)."
-            )
-
-        if not is_busy and not has_current and not queue:
-            queue.append(track)
-            position = 0
-            should_start = True
-        else:
-            queue.append(track)
-            position = len(queue)
+    if not is_busy and not has_current and not queue:
+        queue.append(track)
 
         await save_queue(guild_id)
-
-    if should_start:
         await start_next_track(guild_id)
+
         return 0, True
 
-    await refresh_panel(guild_id)
-    return position, False
+    queue.append(track)
+
+    await save_queue(guild_id)
+    await send_or_update_panel(guild_id)
+
+    return len(queue), False
 
 
 class MatchSelect(discord.ui.Select):
@@ -1424,7 +1223,8 @@ class SearchButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "Эти кнопки доступны только тому, кто запустил поиск.",
+                "Эти кнопки доступны только тому, "
+                "кто запустил поиск.",
                 ephemeral=True,
             )
             return
@@ -1438,7 +1238,6 @@ class SearchButton(discord.ui.Button):
                 interaction=interaction,
                 url=self.track["webpage_url"],
                 title=title,
-                source_name="YouTube",
             )
 
             for item in self.view.children:
@@ -1466,7 +1265,8 @@ class SearchButton(discord.ui.Button):
             print(f"Ошибка выбора поиска: {error!r}")
 
             await interaction.followup.send(
-                "Не удалось добавить трек. Проверь журнал сервера."
+                "Не удалось добавить трек. "
+                "Проверь журнал сервера."
             )
 
 
@@ -1528,7 +1328,10 @@ class FavoriteButton(discord.ui.Button):
             )
 
             if started:
-                message = f"Включаю избранный трек: **{self.track.title}**"
+                message = (
+                    f"Включаю избранный трек: "
+                    f"**{self.track.title}**"
+                )
             else:
                 message = (
                     f"Добавлено из избранного под номером "
@@ -1569,46 +1372,6 @@ class FavoritesView(discord.ui.View):
             )
 
 
-class VolumeModal(discord.ui.Modal, title="Громкость"):
-    percent = discord.ui.TextInput(
-        label="Громкость от 0 до 100",
-        placeholder="Например: 50",
-        min_length=1,
-        max_length=3,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            value = int(str(self.percent))
-        except ValueError:
-            await interaction.response.send_message(
-                "Введи целое число от 0 до 100.", ephemeral=True
-            )
-            return
-
-        if not 0 <= value <= 100:
-            await interaction.response.send_message(
-                "Введи значение от 0 до 100.", ephemeral=True
-            )
-            return
-
-        guild_id = interaction.guild.id
-        new_volume = value / 100
-        volumes[guild_id] = new_volume
-        await save_guild_settings(guild_id)
-
-        voice_client = interaction.guild.voice_client
-        if voice_client and isinstance(
-            voice_client.source, discord.PCMVolumeTransformer
-        ):
-            voice_client.source.volume = new_volume
-
-        await refresh_panel(guild_id)
-        await interaction.response.send_message(
-            f"Громкость установлена: **{value}%**.", ephemeral=True
-        )
-
-
 class MusicPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1619,7 +1382,8 @@ class MusicPanel(discord.ui.View):
     ) -> bool:
         if not is_user_in_bot_channel(interaction):
             await interaction.response.send_message(
-                "Зайди в тот же голосовой канал, в котором находится бот.",
+                "Зайди в тот же голосовой канал, "
+                "в котором находится бот.",
                 ephemeral=True,
             )
             return False
@@ -1716,20 +1480,19 @@ class MusicPanel(discord.ui.View):
         guild_id = interaction.guild.id
         voice_client = interaction.guild.voice_client
 
-        async with get_lock(guild_id):
-            skip_requested.add(guild_id)
-            get_queue(guild_id).clear()
-            is_playing = voice_client.is_playing() or voice_client.is_paused()
-            if not is_playing:
-                current_tracks.pop(guild_id, None)
-                track_details.pop(guild_id, None)
-            await save_queue(guild_id)
+        skip_requested.add(guild_id)
+        get_queue(guild_id).clear()
 
-        if is_playing:
+        await save_queue(guild_id)
+
+        if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
         else:
+            current_tracks.pop(guild_id, None)
+            track_details.pop(guild_id, None)
+
             schedule_idle_disconnect(guild_id)
-        await refresh_panel(guild_id)
+            await send_or_update_panel(guild_id)
 
         await interaction.response.send_message(
             "Воспроизведение остановлено, очередь очищена.",
@@ -1772,22 +1535,6 @@ class MusicPanel(discord.ui.View):
             embed=build_now_playing_embed(interaction.guild.id),
             ephemeral=True,
         )
-
-    @discord.ui.button(
-        emoji="🔊",
-        label="Громкость",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_panel_volume",
-        row=1,
-    )
-    async def volume_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if not await self.check_voice_channel(interaction):
-            return
-        await interaction.response.send_modal(VolumeModal())
 
     @discord.ui.button(
         emoji="❤️",
@@ -1884,28 +1631,27 @@ class MusicPanel(discord.ui.View):
             return
 
         guild_id = interaction.guild.id
-        async with get_lock(guild_id):
-            queue = get_queue(guild_id)
-            if len(queue) < 2:
-                can_shuffle = False
-            else:
-                queue_items = list(queue)
-                random.shuffle(queue_items)
-                queue.clear()
-                queue.extend(queue_items)
-                await save_queue(guild_id)
-                can_shuffle = True
+        queue = get_queue(guild_id)
 
-        if not can_shuffle:
+        if len(queue) < 2:
             await interaction.response.send_message(
                 "Для перемешивания нужно минимум 2 трека в очереди.",
                 ephemeral=True,
             )
             return
 
-        await refresh_panel(guild_id)
+        queue_items = list(queue)
+        random.shuffle(queue_items)
+
+        queue.clear()
+        queue.extend(queue_items)
+
+        await save_queue(guild_id)
+        await send_or_update_panel(guild_id)
+
         await interaction.response.send_message(
-            "Ожидающие треки перемешаны.", ephemeral=True
+            "Ожидающие треки перемешаны.",
+            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -1934,7 +1680,7 @@ class MusicPanel(discord.ui.View):
             repeat_modes[guild_id] = "off"
 
         await save_guild_settings(guild_id)
-        await refresh_panel(guild_id)
+        await send_or_update_panel(guild_id)
 
         await interaction.response.send_message(
             f"Режим повтора: **{get_repeat_text(guild_id)}**",
@@ -1942,35 +1688,11 @@ class MusicPanel(discord.ui.View):
         )
 
     @discord.ui.button(
-        emoji="✨",
-        label="Автовоспроизведение",
-        style=discord.ButtonStyle.secondary,
-        custom_id="music_panel_autoplay",
-        row=2,
-    )
-    async def autoplay(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if not await self.check_voice_channel(interaction):
-            return
-
-        guild_id = interaction.guild.id
-        autoplay_modes[guild_id] = not get_autoplay_mode(guild_id)
-        await save_guild_settings(guild_id)
-        await refresh_panel(guild_id)
-        state = "включено" if get_autoplay_mode(guild_id) else "выключено"
-        await interaction.response.send_message(
-            f"Автовоспроизведение: **{state}**.", ephemeral=True
-        )
-
-    @discord.ui.button(
         emoji="📜",
         label="История",
         style=discord.ButtonStyle.secondary,
         custom_id="music_panel_history",
-        row=2,
+        row=1,
     )
     async def history(
         self,
@@ -1989,11 +1711,10 @@ class MusicPanel(discord.ui.View):
         text = "**Последние воспроизведённые треки:**\n\n"
 
         for index, item in enumerate(history_items, start=1):
-            title, requested_by, source_name, played_at = item
+            title, requested_by, played_at = item
 
             text += (
                 f"{index}. {title}\n"
-                f"Источник: {format_source_name(source_name)}\n"
                 f"Добавил: {requested_by}, время: {played_at}\n\n"
             )
 
@@ -2067,7 +1788,7 @@ async def join(interaction: discord.Interaction):
         if get_queue(guild_id):
             await start_next_track(guild_id)
 
-        await refresh_panel(guild_id)
+        await send_or_update_panel(guild_id)
 
     except Exception as error:
         print(f"Ошибка /join: {error!r}")
@@ -2092,21 +1813,25 @@ async def leave(interaction: discord.Interaction):
         return
 
     guild_id = interaction.guild.id
-    cancel_idle_disconnect(guild_id)
 
-    async with get_lock(guild_id):
-        skip_requested.add(guild_id)
-        get_queue(guild_id).clear()
-        current_tracks.pop(guild_id, None)
-        track_details.pop(guild_id, None)
-        await save_queue(guild_id)
+    cancel_idle_disconnect(guild_id)
+    skip_requested.add(guild_id)
+
+    get_queue(guild_id).clear()
+    current_tracks.pop(guild_id, None)
+    track_details.pop(guild_id, None)
+
+    await save_queue(guild_id)
 
     if voice_client.is_playing() or voice_client.is_paused():
         voice_client.stop()
 
     await voice_client.disconnect()
-    await refresh_panel(guild_id)
-    await interaction.response.send_message("Отключился и очистил очередь.")
+    await send_or_update_panel(guild_id)
+
+    await interaction.response.send_message(
+        "Отключился и очистил очередь."
+    )
 
 
 @bot.tree.command(
@@ -2177,24 +1902,6 @@ async def play(interaction: discord.Interaction, ссылка: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        if is_soundcloud_playlist_url(ссылка):
-            playlist_title, playlist_tracks = await asyncio.to_thread(
-                get_soundcloud_playlist_tracks, ссылка
-            )
-            await add_direct_playlist_to_queue(
-                interaction, playlist_title, playlist_tracks, "SoundCloud"
-            )
-            return
-
-        if is_youtube_playlist_url(ссылка):
-            playlist_title, playlist_tracks = await asyncio.to_thread(
-                get_youtube_playlist_tracks, ссылка
-            )
-            await add_direct_playlist_to_queue(
-                interaction, playlist_title, playlist_tracks, "YouTube"
-            )
-            return
-
         if is_spotify_url(ссылка):
             source_label = "Spotify"
             source_type, music_tracks = await asyncio.to_thread(get_spotify_tracks, ссылка)
@@ -2280,7 +1987,6 @@ async def play(interaction: discord.Interaction, ссылка: str):
             interaction=interaction,
             url=url,
             title=title,
-            source_name=get_source_name_from_url(url),
         )
         if started:
             message = f"Сейчас играет: **{title}**"
@@ -2338,7 +2044,8 @@ async def search(interaction: discord.Interaction, запрос: str):
         print(f"Ошибка /search: {error!r}")
 
         await interaction.followup.send(
-            "Не удалось выполнить поиск. Проверь журнал сервера."
+            "Не удалось выполнить поиск. "
+            "Проверь журнал сервера."
         )
 
 
@@ -2361,7 +2068,8 @@ async def skip(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2388,19 +2096,21 @@ async def skip(interaction: discord.Interaction):
 async def clear(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
 
     guild_id = interaction.guild.id
-    async with get_lock(guild_id):
-        queue_items = get_queue(guild_id)
-        count = len(queue_items)
-        queue_items.clear()
-        await save_queue(guild_id)
+    queue_items = get_queue(guild_id)
+    count = len(queue_items)
 
-    await refresh_panel(guild_id)
+    queue_items.clear()
+
+    await save_queue(guild_id)
+    await send_or_update_panel(guild_id)
+
     await interaction.response.send_message(
         f"Очередь очищена. Удалено треков: {count}."
     )
@@ -2413,7 +2123,8 @@ async def clear(interaction: discord.Interaction):
 async def stop(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2421,23 +2132,20 @@ async def stop(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
     guild_id = interaction.guild.id
 
-    async with get_lock(guild_id):
-        skip_requested.add(guild_id)
-        get_queue(guild_id).clear()
-        is_playing = voice_client.is_playing() or voice_client.is_paused()
+    skip_requested.add(guild_id)
+    get_queue(guild_id).clear()
 
-        if not is_playing:
-            current_tracks.pop(guild_id, None)
-            track_details.pop(guild_id, None)
+    await save_queue(guild_id)
 
-        await save_queue(guild_id)
-
-    if is_playing:
+    if voice_client.is_playing() or voice_client.is_paused():
         voice_client.stop()
     else:
-        schedule_idle_disconnect(guild_id)
+        current_tracks.pop(guild_id, None)
+        track_details.pop(guild_id, None)
 
-    await refresh_panel(guild_id)
+        schedule_idle_disconnect(guild_id)
+        await send_or_update_panel(guild_id)
+
     await interaction.response.send_message(
         "Воспроизведение остановлено, очередь очищена."
     )
@@ -2452,7 +2160,8 @@ async def pause(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2487,7 +2196,8 @@ async def resume(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2530,7 +2240,8 @@ async def volume(interaction: discord.Interaction, процент: int):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2603,13 +2314,11 @@ async def history(interaction: discord.Interaction):
 
     text = "**Последние воспроизведённые треки:**\n\n"
 
-    # --- ИСПРАВЛЕНА РАСПАКОВКА КОРТЕЖА (4 ЗНАЧЕНИЯ) ---
     for index, item in enumerate(history_items, start=1):
-        title, requested_by, source_name, played_at = item
+        title, requested_by, played_at = item
 
         text += (
             f"{index}. {title}\n"
-            f"Источник: {format_source_name(source_name)}\n"
             f"Добавил: {requested_by}, время: {played_at}\n\n"
         )
 
@@ -2623,34 +2332,34 @@ async def history(interaction: discord.Interaction):
 async def shuffle(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
 
     guild_id = interaction.guild.id
-    async with get_lock(guild_id):
-        queue_items = get_queue(guild_id)
+    queue_items = get_queue(guild_id)
 
-        if len(queue_items) < 2:
-            can_shuffle = False
-        else:
-            tracks = list(queue_items)
-            random.shuffle(tracks)
-            queue_items.clear()
-            queue_items.extend(tracks)
-            await save_queue(guild_id)
-            can_shuffle = True
-
-    if not can_shuffle:
+    if len(queue_items) < 2:
         await interaction.response.send_message(
             "Для перемешивания нужно минимум 2 трека в очереди.",
             ephemeral=True,
         )
         return
 
-    await refresh_panel(guild_id)
-    await interaction.response.send_message("Ожидающие треки перемешаны.")
+    tracks = list(queue_items)
+    random.shuffle(tracks)
+
+    queue_items.clear()
+    queue_items.extend(tracks)
+
+    await save_queue(guild_id)
+    await send_or_update_panel(guild_id)
+
+    await interaction.response.send_message(
+        "Ожидающие треки перемешаны."
+    )
 
 
 @bot.tree.command(
@@ -2660,7 +2369,8 @@ async def shuffle(interaction: discord.Interaction):
 async def repeat(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, в котором находится бот.",
+            "Зайди в тот же голосовой канал, "
+            "в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2676,7 +2386,7 @@ async def repeat(interaction: discord.Interaction):
         repeat_modes[guild_id] = "off"
 
     await save_guild_settings(guild_id)
-    await refresh_panel(guild_id)
+    await send_or_update_panel(guild_id)
 
     await interaction.response.send_message(
         f"Режим повтора: **{get_repeat_text(guild_id)}**"
@@ -2685,55 +2395,29 @@ async def repeat(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="panel",
-    description="Отправить музыкальную панель",
+    description="Создать музыкальную панель внизу канала",
 )
 async def panel(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(
-            "Создавать панель могут только пользователи с правом «Управлять сервером».",
+            "Команда доступна только администраторам сервера.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_message(
-        embed=build_now_playing_embed(interaction.guild.id),
-        view=MusicPanel(),
-    )
-    message = await interaction.original_response()
-    await save_panel_location(
-        guild_id=interaction.guild.id,
-        channel_id=interaction.channel_id,
-        message_id=message.id,
-    )
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    message = await send_or_update_panel(interaction.guild.id, interaction.channel)
 
-
-@bot.tree.command(
-    name="panel_delete",
-    description="Удалить сохранённую музыкальную панель",
-)
-async def panel_delete(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "Удалять панель могут только пользователи с правом «Управлять сервером».",
+    if message is None:
+        await interaction.followup.send(
+            "Не удалось создать панель. Проверь права бота на удаление и отправку сообщений.",
             ephemeral=True,
         )
         return
 
-    location = panel_locations.get(interaction.guild.id)
-    if not location:
-        await interaction.response.send_message("Сохранённая панель не найдена.", ephemeral=True)
-        return
-
-    channel_id, message_id = location
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        message = await channel.fetch_message(message_id)
-        await message.delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
-
-    await delete_panel_location(interaction.guild.id)
-    await interaction.response.send_message("Музыкальная панель удалена.", ephemeral=True)
-
+    await interaction.followup.send(
+        "Панель перемещена в самый низ канала.",
+        ephemeral=True,
+    )
 
 bot.run(TOKEN)
