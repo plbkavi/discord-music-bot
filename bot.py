@@ -564,6 +564,7 @@ def find_autoplay_track(previous_track: Track) -> Track | None:
             )
     return None
 
+
 def is_spotify_url(url: str) -> bool:
     return "open.spotify.com/" in url or url.startswith("spotify:")
 
@@ -727,8 +728,7 @@ def get_yandex_tracks(url: str) -> tuple[str, list[tuple[str, str]]]:
         return "альбом", tracks[:MAX_SPOTIFY_TRACKS]
 
     raise RuntimeError(
-        "Поддерживаются ссылки Яндекс Музыки на трек или альбом. "
-        "Плейлисты можно добавить позже отдельно."
+        "Поддерживаются ссылки Яндекс Музыки на трек или альбом."
     )
 
 
@@ -796,7 +796,6 @@ def search_soundcloud(query: str) -> list[dict]:
     ]
 
 
-
 def build_candidates(query: str) -> list[MatchCandidate]:
     candidates: list[MatchCandidate] = []
     seen_urls: set[str] = set()
@@ -834,6 +833,16 @@ def build_candidates(query: str) -> list[MatchCandidate]:
         )
 
     return candidates
+
+
+# --- ДОБАВЛЕНА НЕДОСТАЮЩАЯ ФУНКЦИЯ ДЛЯ АВТОПОИСКА МНОЖЕСТВЕННЫХ ТРЕКОВ ---
+def resolve_music_track(query: str) -> tuple[str, str, str]:
+    candidates = build_candidates(query)
+    if not candidates:
+        raise RuntimeError(f"Не удалось найти трек по запросу: {query}")
+    first = candidates[0]
+    return first.url, first.title, first.source_name
+
 
 def get_now_playing_text(guild_id: int) -> str:
     track = current_tracks.get(guild_id)
@@ -1168,7 +1177,6 @@ async def on_track_finished(
             )
             if recommendation:
                 async with get_lock(guild_id):
-                    # Do not override tracks added while YouTube search was running.
                     if not get_queue(guild_id):
                         get_queue(guild_id).append(recommendation)
                         await save_queue(guild_id)
@@ -1416,8 +1424,7 @@ class SearchButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "Эти кнопки доступны только тому, "
-                "кто запустил поиск.",
+                "Эти кнопки доступны только тому, кто запустил поиск.",
                 ephemeral=True,
             )
             return
@@ -1459,8 +1466,7 @@ class SearchButton(discord.ui.Button):
             print(f"Ошибка выбора поиска: {error!r}")
 
             await interaction.followup.send(
-                "Не удалось добавить трек. "
-                "Проверь журнал сервера."
+                "Не удалось добавить трек. Проверь журнал сервера."
             )
 
 
@@ -1522,10 +1528,7 @@ class FavoriteButton(discord.ui.Button):
             )
 
             if started:
-                message = (
-                    f"Включаю избранный трек: "
-                    f"**{self.track.title}**"
-                )
+                message = f"Включаю избранный трек: **{self.track.title}**"
             else:
                 message = (
                     f"Добавлено из избранного под номером "
@@ -1616,8 +1619,7 @@ class MusicPanel(discord.ui.View):
     ) -> bool:
         if not is_user_in_bot_channel(interaction):
             await interaction.response.send_message(
-                "Зайди в тот же голосовой канал, "
-                "в котором находится бот.",
+                "Зайди в тот же голосовой канал, в котором находится бот.",
                 ephemeral=True,
             )
             return False
@@ -2336,8 +2338,7 @@ async def search(interaction: discord.Interaction, запрос: str):
         print(f"Ошибка /search: {error!r}")
 
         await interaction.followup.send(
-            "Не удалось выполнить поиск. "
-            "Проверь журнал сервера."
+            "Не удалось выполнить поиск. Проверь журнал сервера."
         )
 
 
@@ -2360,8 +2361,7 @@ async def skip(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2388,8 +2388,7 @@ async def skip(interaction: discord.Interaction):
 async def clear(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2414,8 +2413,7 @@ async def clear(interaction: discord.Interaction):
 async def stop(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2454,8 +2452,7 @@ async def pause(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2490,8 +2487,7 @@ async def resume(interaction: discord.Interaction):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2534,8 +2530,7 @@ async def volume(interaction: discord.Interaction, процент: int):
 
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2608,11 +2603,13 @@ async def history(interaction: discord.Interaction):
 
     text = "**Последние воспроизведённые треки:**\n\n"
 
+    # --- ИСПРАВЛЕНА РАСПАКОВКА КОРТЕЖА (4 ЗНАЧЕНИЯ) ---
     for index, item in enumerate(history_items, start=1):
-        title, requested_by, played_at = item
+        title, requested_by, source_name, played_at = item
 
         text += (
             f"{index}. {title}\n"
+            f"Источник: {format_source_name(source_name)}\n"
             f"Добавил: {requested_by}, время: {played_at}\n\n"
         )
 
@@ -2626,8 +2623,7 @@ async def history(interaction: discord.Interaction):
 async def shuffle(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
@@ -2664,8 +2660,7 @@ async def shuffle(interaction: discord.Interaction):
 async def repeat(interaction: discord.Interaction):
     if not is_user_in_bot_channel(interaction):
         await interaction.response.send_message(
-            "Зайди в тот же голосовой канал, "
-            "в котором находится бот.",
+            "Зайди в тот же голосовой канал, в котором находится бот.",
             ephemeral=True,
         )
         return
