@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import traceback
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -16,14 +17,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("music_bot")
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 YANDEX_MUSIC_TOKEN = os.getenv("YANDEX_MUSIC_TOKEN")
-GUILD_ID = 661168864523976716
-
-DATABASE_PATH = "/opt/discord_bot/music_bot.db"
-TEST_SOUND_PATH = "/opt/discord_bot/sounds/test.mp3"
+GUILD_ID_RAW = os.getenv("GUILD_ID")
+GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW else None
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/opt/discord_bot/music_bot.db")
+TEST_SOUND_PATH = os.getenv("TEST_SOUND_PATH", "/opt/discord_bot/sounds/test.mp3")
 IDLE_DISCONNECT_SECONDS = 120
 MAX_HISTORY_ITEMS = 20
 MAX_FAVORITES_SHOWN = 20
@@ -61,6 +68,8 @@ YTDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
+    "source_address": "0.0.0.0",
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
 }
 
 SEARCH_OPTIONS = {
@@ -176,7 +185,10 @@ def format_duration(seconds) -> str:
 
 
 async def init_database():
-    async with aiosqlite.connect(DATABASE_PATH) as db:
+    async with aiosqlite.connect(DATABASE_PATH, timeout=10) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout = 10000")
+        await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -685,6 +697,14 @@ def build_candidates(query: str) -> list[MatchCandidate]:
 
     return candidates
 
+def resolve_music_track(query: str) -> tuple[str, str, str]:
+    candidates = build_candidates(query)
+    if not candidates:
+        raise RuntimeError(f"Не найдено: {query}")
+    candidate = candidates[0]
+    return candidate.url, candidate.title, candidate.source_name
+
+
 def get_now_playing_text(guild_id: int) -> str:
     track = current_tracks.get(guild_id)
 
@@ -1076,13 +1096,13 @@ async def start_next_track(guild_id: int):
         await send_or_update_panel(guild_id)
 
     except Exception as error:
-        print(f"Ошибка запуска трека: {error!r}")
+        logger.exception("Ошибка запуска трека: %r", error)
 
         current_tracks.pop(guild_id, None)
         track_details.pop(guild_id, None)
 
         await send_or_update_panel(guild_id)
-        await start_next_track(guild_id)
+        asyncio.create_task(start_next_track(guild_id))
 
 
 async def add_to_queue(
@@ -1093,41 +1113,30 @@ async def add_to_queue(
     original_query: str = "",
 ) -> tuple[int, bool]:
     voice_client = await connect_to_user_voice(interaction)
-
     if voice_client is None:
         raise ValueError("Сначала зайди в голосовой канал.")
 
     guild_id = interaction.guild.id
-
     cancel_idle_disconnect(guild_id)
+    track = Track(title, url, interaction.user.display_name, source_name, original_query)
 
-    queue = get_queue(guild_id)
+    async with get_lock(guild_id):
+        queue = get_queue(guild_id)
+        if len(queue) >= MAX_QUEUE_SIZE:
+            raise ValueError(f"Очередь переполнена (макс. {MAX_QUEUE_SIZE}).")
 
-    track = Track(
-        title=title,
-        url=url,
-        requested_by=interaction.user.display_name,
-        source_name=source_name,
-        original_query=original_query,
-    )
-
-    is_busy = voice_client.is_playing() or voice_client.is_paused()
-    has_current = guild_id in current_tracks
-
-    if not is_busy and not has_current and not queue:
+        is_busy = voice_client.is_playing() or voice_client.is_paused()
+        should_start = not is_busy and guild_id not in current_tracks and not queue
         queue.append(track)
-
+        position = 0 if should_start else len(queue)
         await save_queue(guild_id)
-        await start_next_track(guild_id)
 
+    if should_start:
+        await start_next_track(guild_id)
         return 0, True
 
-    queue.append(track)
-
-    await save_queue(guild_id)
     await send_or_update_panel(guild_id)
-
-    return len(queue), False
+    return position, False
 
 
 class MatchSelect(discord.ui.Select):
@@ -1738,15 +1747,17 @@ class DiscordBot(discord.Client):
 
         self.add_view(MusicPanel())
 
-        guild = discord.Object(id=GUILD_ID)
-
-        self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
-
-        print(f"Синхронизировано команд: {len(synced)}")
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info("Синхронизировано команд для GUILD_ID=%s: %s", GUILD_ID, len(synced))
+        else:
+            synced = await self.tree.sync()
+            logger.info("Глобально синхронизировано команд: %s", len(synced))
 
     async def on_ready(self):
-        print(f"Бот подключён как {self.user}.")
+        logger.info("Бот подключён как %s.", self.user)
 
 
 bot = DiscordBot()
